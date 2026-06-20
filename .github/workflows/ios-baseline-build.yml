@@ -52,30 +52,6 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
 
-      - name: Install Qt 6.7.2 for iOS
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 -m pip install --disable-pip-version-check "aqtinstall==3.3.0"
-
-          python3 -m aqt install-qt \
-            mac ios "${QT_VERSION}" ios \
-            --autodesktop \
-            --modules qtmultimedia \
-            --outputdir "${RUNNER_TEMP}/Qt"
-
-          QT_IOS_ROOT="${RUNNER_TEMP}/Qt/${QT_VERSION}/ios"
-
-          if [[ ! -x "${QT_IOS_ROOT}/bin/qmake" ]]; then
-            echo "iOS qmake was not installed at ${QT_IOS_ROOT}/bin/qmake"
-            find "${RUNNER_TEMP}/Qt" -maxdepth 4 -type f -name qmake -print || true
-            exit 1
-          fi
-
-          echo "QT_IOS_ROOT=${QT_IOS_ROOT}" >> "${GITHUB_ENV}"
-          "${QT_IOS_ROOT}/bin/qmake" -v
-
       - name: Create build and artifact folders
         shell: bash
         run: |
@@ -89,6 +65,40 @@ jobs:
 
           echo "BUILD_ROOT=${BUILD_ROOT}" >> "${GITHUB_ENV}"
           echo "ARTIFACT_ROOT=${ARTIFACT_ROOT}" >> "${GITHUB_ENV}"
+
+      - name: Install Qt 6.7.2 for iOS
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          AQT_VENV="${RUNNER_TEMP}/aqt-venv"
+          rm -rf "${AQT_VENV}"
+          python3 -m venv "${AQT_VENV}"
+
+          "${AQT_VENV}/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --upgrade pip
+
+          "${AQT_VENV}/bin/python" -m pip install \
+            --disable-pip-version-check \
+            "aqtinstall==3.3.0"
+
+          "${AQT_VENV}/bin/python" -m aqt install-qt \
+            mac ios "${QT_VERSION}" ios \
+            --autodesktop \
+            --modules qtmultimedia \
+            --outputdir "${RUNNER_TEMP}/Qt"
+
+          QT_IOS_ROOT="${RUNNER_TEMP}/Qt/${QT_VERSION}/ios"
+
+          if [[ ! -x "${QT_IOS_ROOT}/bin/qmake" ]]; then
+            echo "iOS qmake was not installed at ${QT_IOS_ROOT}/bin/qmake"
+            find "${RUNNER_TEMP}/Qt" -maxdepth 5 -type f -name qmake -print || true
+            exit 1
+          fi
+
+          echo "QT_IOS_ROOT=${QT_IOS_ROOT}" >> "${GITHUB_ENV}"
+          "${QT_IOS_ROOT}/bin/qmake" -v
 
       - name: Generate the Xcode project with qmake
         id: qmake
@@ -181,6 +191,8 @@ jobs:
         run: |
           set +e
 
+          mkdir -p "${ARTIFACT_ROOT}"
+
           {
             echo "DroidStar iOS unchanged-source baseline build"
             echo "UTC date: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -205,14 +217,14 @@ jobs:
             echo
             echo "qmake stage status: ${{ steps.qmake.outputs.status }}"
             echo "xcodebuild stage status: ${{ steps.xcodebuild.outputs.status }}"
-          } > "${ARTIFACT_ROOT:-${RUNNER_TEMP}}/BUILD-MANIFEST.txt"
+          } > "${ARTIFACT_ROOT}/BUILD-MANIFEST.txt"
 
       - name: Upload build evidence and unsigned IPA
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: DroidStar-iOS-baseline-${{ github.run_number }}
-          path: ${{ env.ARTIFACT_ROOT }}
+          path: ${{ runner.temp }}/DroidStar-iOS-artifacts
           if-no-files-found: warn
           retention-days: 14
 
