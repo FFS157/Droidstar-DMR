@@ -1,0 +1,242 @@
+name: iOS Baseline - Unchanged Source
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  QT_VERSION: "6.7.2"
+  UPSTREAM_BASELINE_SHA: "ab8418f0b2a27714788d0a1f1f1ae7188994762c"
+  XCODE_DEVELOPER_DIR: "/Applications/Xcode_15.4.app/Contents/Developer"
+  BUILD_ROOT: "${{ runner.temp }}/DroidStar-iOS-build"
+  ARTIFACT_ROOT: "${{ runner.temp }}/DroidStar-iOS-artifacts"
+
+jobs:
+  build-unsigned-ios:
+    name: Build unsigned iOS baseline
+    runs-on: macos-14
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify application source is unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git cat-file -e "${UPSTREAM_BASELINE_SHA}^{commit}"
+
+          git diff --exit-code "${UPSTREAM_BASELINE_SHA}" -- . \
+            ':(exclude).github/workflows/ios-baseline-build.yml'
+
+          echo "Application source matches upstream baseline ${UPSTREAM_BASELINE_SHA}."
+          echo "Only the Stage 1 workflow file differs."
+
+      - name: Select Xcode 15.4
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -d "${XCODE_DEVELOPER_DIR}" ]]; then
+            echo "Expected Xcode was not found at ${XCODE_DEVELOPER_DIR}."
+            echo "Installed Xcode applications:"
+            find /Applications -maxdepth 1 -type d -name 'Xcode*.app' -print | sort
+            exit 1
+          fi
+
+          sudo xcode-select --switch "${XCODE_DEVELOPER_DIR}"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install Qt 6.7.2 for iOS
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install --disable-pip-version-check "aqtinstall==3.3.0"
+
+          python3 -m aqt install-qt \
+            mac ios "${QT_VERSION}" ios \
+            --autodesktop \
+            --modules qtmultimedia qtshadertools \
+            --outputdir "${RUNNER_TEMP}/Qt"
+
+          QT_IOS_ROOT="${RUNNER_TEMP}/Qt/${QT_VERSION}/ios"
+
+          if [[ ! -x "${QT_IOS_ROOT}/bin/qmake" ]]; then
+            echo "iOS qmake was not installed at ${QT_IOS_ROOT}/bin/qmake"
+            find "${RUNNER_TEMP}/Qt" -maxdepth 4 -type f -name qmake -print || true
+            exit 1
+          fi
+
+          echo "QT_IOS_ROOT=${QT_IOS_ROOT}" >> "${GITHUB_ENV}"
+          "${QT_IOS_ROOT}/bin/qmake" -v
+
+      - name: Create build and artifact folders
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf "${BUILD_ROOT}" "${ARTIFACT_ROOT}"
+          mkdir -p "${BUILD_ROOT}" "${ARTIFACT_ROOT}"
+
+      - name: Generate the Xcode project with qmake
+        id: qmake
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+
+          cd "${BUILD_ROOT}"
+
+          "${QT_IOS_ROOT}/bin/qmake" \
+            "${GITHUB_WORKSPACE}/DroidStar.pro" \
+            CONFIG+=release \
+            2>&1 | tee "${ARTIFACT_ROOT}/qmake.log"
+
+          QMAKE_STATUS=${PIPESTATUS[0]}
+          echo "status=${QMAKE_STATUS}" >> "${GITHUB_OUTPUT}"
+
+          if [[ ${QMAKE_STATUS} -eq 0 ]]; then
+            xcodebuild -list -project "${BUILD_ROOT}/DroidStar.xcodeproj" \
+              2>&1 | tee "${ARTIFACT_ROOT}/xcode-project-list.log"
+
+            ditto -c -k --sequesterRsrc --keepParent \
+              "${BUILD_ROOT}/DroidStar.xcodeproj" \
+              "${ARTIFACT_ROOT}/DroidStar.xcodeproj.zip"
+          fi
+
+          exit 0
+
+      - name: Build the unsigned iPhone application
+        id: xcodebuild
+        if: steps.qmake.outputs.status == '0'
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+
+          mkdir -p "${BUILD_ROOT}/output"
+
+          xcodebuild \
+            -project "${BUILD_ROOT}/DroidStar.xcodeproj" \
+            -target DroidStar \
+            -configuration Release \
+            -sdk iphoneos \
+            -arch arm64 \
+            CONFIGURATION_BUILD_DIR="${BUILD_ROOT}/output" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            build \
+            2>&1 | tee "${ARTIFACT_ROOT}/xcodebuild.log"
+
+          BUILD_STATUS=${PIPESTATUS[0]}
+          echo "status=${BUILD_STATUS}" >> "${GITHUB_OUTPUT}"
+          exit 0
+
+      - name: Package the unsigned IPA
+        if: steps.xcodebuild.outputs.status == '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_PATH="$(find "${BUILD_ROOT}/output" -maxdepth 2 -type d -name '*.app' -print -quit)"
+
+          if [[ -z "${APP_PATH}" ]]; then
+            echo "The Xcode build succeeded but no .app bundle was found."
+            find "${BUILD_ROOT}/output" -maxdepth 3 -print
+            exit 1
+          fi
+
+          PACKAGE_ROOT="${ARTIFACT_ROOT}/unsigned-ipa"
+          rm -rf "${PACKAGE_ROOT}"
+          mkdir -p "${PACKAGE_ROOT}/Payload"
+
+          ditto "${APP_PATH}" "${PACKAGE_ROOT}/Payload/$(basename "${APP_PATH}")"
+
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          IPA_NAME="DroidStar-iOS-unsigned-${SHORT_SHA}.ipa"
+
+          cd "${PACKAGE_ROOT}"
+          /usr/bin/zip -qry "${ARTIFACT_ROOT}/${IPA_NAME}" Payload
+
+          echo "Unsigned IPA created: ${ARTIFACT_ROOT}/${IPA_NAME}"
+          /usr/bin/du -h "${ARTIFACT_ROOT}/${IPA_NAME}"
+
+      - name: Write the build manifest
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p "${ARTIFACT_ROOT}"
+
+          {
+            echo "DroidStar iOS unchanged-source baseline build"
+            echo "UTC date: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "Repository commit: ${GITHUB_SHA}"
+            echo "Required upstream baseline: ${UPSTREAM_BASELINE_SHA}"
+            echo "Runner: ${RUNNER_NAME}"
+            echo "Runner OS: ${RUNNER_OS}"
+            echo "Runner architecture: ${RUNNER_ARCH}"
+            echo
+            echo "Xcode:"
+            xcodebuild -version 2>&1
+            echo
+            echo "iPhoneOS SDK:"
+            xcrun --sdk iphoneos --show-sdk-version 2>&1
+            echo
+            echo "Qt iOS qmake:"
+            if [[ -n "${QT_IOS_ROOT:-}" && -x "${QT_IOS_ROOT}/bin/qmake" ]]; then
+              "${QT_IOS_ROOT}/bin/qmake" -v 2>&1
+            else
+              echo "Qt iOS qmake was not available."
+            fi
+            echo
+            echo "qmake stage status: ${{ steps.qmake.outputs.status }}"
+            echo "xcodebuild stage status: ${{ steps.xcodebuild.outputs.status }}"
+          } > "${ARTIFACT_ROOT}/BUILD-MANIFEST.txt"
+
+      - name: Upload build evidence and unsigned IPA
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DroidStar-iOS-baseline-${{ github.run_number }}
+          path: ${{ env.ARTIFACT_ROOT }}
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce the Stage 1 build gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          QMAKE_STATUS="${{ steps.qmake.outputs.status }}"
+          BUILD_STATUS="${{ steps.xcodebuild.outputs.status }}"
+
+          if [[ "${QMAKE_STATUS}" != "0" ]]; then
+            echo "STAGE 1 FAILED: qmake did not generate the Xcode project."
+            exit 1
+          fi
+
+          if [[ "${BUILD_STATUS}" != "0" ]]; then
+            echo "STAGE 1 FAILED: Xcode did not build the unchanged source."
+            exit 1
+          fi
+
+          IPA_COUNT="$(find "${ARTIFACT_ROOT}" -maxdepth 1 -type f -name '*.ipa' | wc -l | tr -d ' ')"
+
+          if [[ "${IPA_COUNT}" != "1" ]]; then
+            echo "STAGE 1 FAILED: expected exactly one unsigned IPA, found ${IPA_COUNT}."
+            exit 1
+          fi
+
+          echo "STAGE 1 PASSED: unchanged source produced one unsigned IPA."
