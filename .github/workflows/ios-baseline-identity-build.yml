@@ -1,0 +1,346 @@
+name: iOS Baseline - M7FTM Separate Identity
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  QT_VERSION: "6.7.2"
+  UPSTREAM_BASELINE_SHA: "ab8418f0b2a27714788d0a1f1f1ae7188994762c"
+  XCODE_DEVELOPER_DIR: "/Applications/Xcode_15.4.app/Contents/Developer"
+  TEST_BUNDLE_ID: "uk.co.m7ftm.droidstarbaseline"
+  TEST_DISPLAY_NAME: "M7FTM DMR Baseline"
+
+jobs:
+  build-unsigned-ios:
+    name: Build M7FTM separate-install baseline
+    runs-on: macos-14
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify application source is unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git cat-file -e "${UPSTREAM_BASELINE_SHA}^{commit}"
+
+          git diff --exit-code "${UPSTREAM_BASELINE_SHA}" -- . \
+            ':(exclude).github/**'
+
+          echo "Application source matches upstream baseline ${UPSTREAM_BASELINE_SHA}."
+          echo "Only GitHub workflow files are excluded from this verification."
+
+      - name: Select Xcode 15.4
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -d "${XCODE_DEVELOPER_DIR}" ]]; then
+            echo "Expected Xcode was not found at ${XCODE_DEVELOPER_DIR}."
+            echo "Installed Xcode applications:"
+            find /Applications -maxdepth 1 -type d -name 'Xcode*.app' -print | sort
+            exit 1
+          fi
+
+          sudo xcode-select --switch "${XCODE_DEVELOPER_DIR}"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Create build and artifact folders
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUILD_ROOT="${RUNNER_TEMP}/DroidStar-iOS-identity-build"
+          ARTIFACT_ROOT="${RUNNER_TEMP}/DroidStar-iOS-identity-artifacts"
+
+          rm -rf "${BUILD_ROOT}" "${ARTIFACT_ROOT}"
+          mkdir -p "${BUILD_ROOT}" "${ARTIFACT_ROOT}"
+
+          echo "BUILD_ROOT=${BUILD_ROOT}" >> "${GITHUB_ENV}"
+          echo "ARTIFACT_ROOT=${ARTIFACT_ROOT}" >> "${GITHUB_ENV}"
+
+      - name: Install Qt 6.7.2 for iOS
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          AQT_VENV="${RUNNER_TEMP}/aqt-venv"
+          rm -rf "${AQT_VENV}"
+          python3 -m venv "${AQT_VENV}"
+
+          "${AQT_VENV}/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --upgrade pip
+
+          "${AQT_VENV}/bin/python" -m pip install \
+            --disable-pip-version-check \
+            "aqtinstall==3.3.0"
+
+          "${AQT_VENV}/bin/python" -m aqt install-qt \
+            mac ios "${QT_VERSION}" ios \
+            --autodesktop \
+            --modules qtmultimedia \
+            --outputdir "${RUNNER_TEMP}/Qt"
+
+          QT_IOS_ROOT="${RUNNER_TEMP}/Qt/${QT_VERSION}/ios"
+
+          if [[ ! -x "${QT_IOS_ROOT}/bin/qmake" ]]; then
+            echo "iOS qmake was not installed at ${QT_IOS_ROOT}/bin/qmake"
+            find "${RUNNER_TEMP}/Qt" -maxdepth 5 -type f -name qmake -print || true
+            exit 1
+          fi
+
+          echo "QT_IOS_ROOT=${QT_IOS_ROOT}" >> "${GITHUB_ENV}"
+          "${QT_IOS_ROOT}/bin/qmake" -v
+
+      - name: Generate the Xcode project with qmake
+        id: qmake
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+
+          cd "${BUILD_ROOT}"
+
+          "${QT_IOS_ROOT}/bin/qmake" \
+            "${GITHUB_WORKSPACE}/DroidStar.pro" \
+            CONFIG+=release \
+            2>&1 | tee "${ARTIFACT_ROOT}/qmake.log"
+
+          QMAKE_STATUS=${PIPESTATUS[0]}
+          echo "status=${QMAKE_STATUS}" >> "${GITHUB_OUTPUT}"
+
+          if [[ ${QMAKE_STATUS} -eq 0 ]]; then
+            xcodebuild -list -project "${BUILD_ROOT}/DroidStar.xcodeproj" \
+              2>&1 | tee "${ARTIFACT_ROOT}/xcode-project-list.log"
+
+            ditto -c -k --sequesterRsrc --keepParent \
+              "${BUILD_ROOT}/DroidStar.xcodeproj" \
+              "${ARTIFACT_ROOT}/DroidStar.xcodeproj.zip"
+          fi
+
+          exit 0
+
+      - name: Build with separate bundle identifier
+        id: xcodebuild
+        if: steps.qmake.outputs.status == '0'
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+
+          mkdir -p "${BUILD_ROOT}/output"
+
+          xcodebuild \
+            -project "${BUILD_ROOT}/DroidStar.xcodeproj" \
+            -target DroidStar \
+            -configuration Release \
+            -sdk iphoneos \
+            -arch arm64 \
+            CONFIGURATION_BUILD_DIR="${BUILD_ROOT}/output" \
+            PRODUCT_BUNDLE_IDENTIFIER="${TEST_BUNDLE_ID}" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            build \
+            2>&1 | tee "${ARTIFACT_ROOT}/xcodebuild.log"
+
+          BUILD_STATUS=${PIPESTATUS[0]}
+          echo "status=${BUILD_STATUS}" >> "${GITHUB_OUTPUT}"
+          exit 0
+
+      - name: Apply and verify separate-install identity
+        id: identity
+        if: steps.xcodebuild.outputs.status == '0'
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+
+          APP_PATH="$(find "${BUILD_ROOT}/output" -maxdepth 2 -type d -name '*.app' -print -quit)"
+
+          if [[ -z "${APP_PATH}" ]]; then
+            echo "No .app bundle was found after the successful Xcode build."
+            echo "status=1" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          INFO_PLIST="${APP_PATH}/Info.plist"
+
+          if [[ ! -f "${INFO_PLIST}" ]]; then
+            echo "Info.plist was not found at ${INFO_PLIST}."
+            echo "status=1" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleDisplayName ${TEST_DISPLAY_NAME}" \
+            "${INFO_PLIST}"
+
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleName DroidStar" \
+            "${INFO_PLIST}"
+
+          ACTUAL_BUNDLE_ID="$(
+            /usr/libexec/PlistBuddy \
+              -c 'Print :CFBundleIdentifier' \
+              "${INFO_PLIST}"
+          )"
+
+          ACTUAL_DISPLAY_NAME="$(
+            /usr/libexec/PlistBuddy \
+              -c 'Print :CFBundleDisplayName' \
+              "${INFO_PLIST}"
+          )"
+
+          ACTUAL_EXECUTABLE="$(
+            /usr/libexec/PlistBuddy \
+              -c 'Print :CFBundleExecutable' \
+              "${INFO_PLIST}"
+          )"
+
+          {
+            echo "Expected bundle identifier: ${TEST_BUNDLE_ID}"
+            echo "Actual bundle identifier:   ${ACTUAL_BUNDLE_ID}"
+            echo "Expected display name:      ${TEST_DISPLAY_NAME}"
+            echo "Actual display name:        ${ACTUAL_DISPLAY_NAME}"
+            echo "Executable:                 ${ACTUAL_EXECUTABLE}"
+            echo "Application bundle:         $(basename "${APP_PATH}")"
+          } | tee "${ARTIFACT_ROOT}/IDENTITY-REPORT.txt"
+
+          if [[ "${ACTUAL_BUNDLE_ID}" != "${TEST_BUNDLE_ID}" ]]; then
+            echo "Bundle identifier verification failed."
+            echo "status=1" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [[ "${ACTUAL_DISPLAY_NAME}" != "${TEST_DISPLAY_NAME}" ]]; then
+            echo "Display-name verification failed."
+            echo "status=1" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "APP_PATH=${APP_PATH}" >> "${GITHUB_ENV}"
+          echo "status=0" >> "${GITHUB_OUTPUT}"
+          exit 0
+
+      - name: Package the separate-install unsigned IPA
+        if: steps.identity.outputs.status == '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PACKAGE_ROOT="${ARTIFACT_ROOT}/unsigned-ipa"
+          rm -rf "${PACKAGE_ROOT}"
+          mkdir -p "${PACKAGE_ROOT}/Payload"
+
+          ditto \
+            "${APP_PATH}" \
+            "${PACKAGE_ROOT}/Payload/$(basename "${APP_PATH}")"
+
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          IPA_NAME="M7FTM-DMR-Baseline-unsigned-${SHORT_SHA}.ipa"
+
+          cd "${PACKAGE_ROOT}"
+          /usr/bin/zip -qry "${ARTIFACT_ROOT}/${IPA_NAME}" Payload
+
+          echo "Unsigned IPA created: ${ARTIFACT_ROOT}/${IPA_NAME}"
+          /usr/bin/du -h "${ARTIFACT_ROOT}/${IPA_NAME}"
+
+      - name: Write the build manifest
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          mkdir -p "${ARTIFACT_ROOT}"
+
+          {
+            echo "DroidStar iOS separate-install identity baseline"
+            echo "UTC date: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "Repository commit: ${GITHUB_SHA}"
+            echo "Required upstream baseline: ${UPSTREAM_BASELINE_SHA}"
+            echo "Bundle identifier: ${TEST_BUNDLE_ID}"
+            echo "Display name: ${TEST_DISPLAY_NAME}"
+            echo "Runner: ${RUNNER_NAME}"
+            echo "Runner OS: ${RUNNER_OS}"
+            echo "Runner architecture: ${RUNNER_ARCH}"
+            echo
+            echo "Xcode:"
+            xcodebuild -version 2>&1
+            echo
+            echo "iPhoneOS SDK:"
+            xcrun --sdk iphoneos --show-sdk-version 2>&1
+            echo
+            echo "Qt iOS qmake:"
+            if [[ -n "${QT_IOS_ROOT:-}" && -x "${QT_IOS_ROOT}/bin/qmake" ]]; then
+              "${QT_IOS_ROOT}/bin/qmake" -v 2>&1
+            else
+              echo "Qt iOS qmake was not available."
+            fi
+            echo
+            echo "qmake stage status: ${{ steps.qmake.outputs.status }}"
+            echo "xcodebuild stage status: ${{ steps.xcodebuild.outputs.status }}"
+            echo "identity stage status: ${{ steps.identity.outputs.status }}"
+          } > "${ARTIFACT_ROOT}/BUILD-MANIFEST.txt"
+
+      - name: Upload separate-install IPA and build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: M7FTM-DMR-baseline-identity-${{ github.run_number }}
+          path: ${{ runner.temp }}/DroidStar-iOS-identity-artifacts
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce the Stage 2 identity gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          QMAKE_STATUS="${{ steps.qmake.outputs.status }}"
+          BUILD_STATUS="${{ steps.xcodebuild.outputs.status }}"
+          IDENTITY_STATUS="${{ steps.identity.outputs.status }}"
+
+          if [[ "${QMAKE_STATUS}" != "0" ]]; then
+            echo "STAGE 2 FAILED: qmake did not generate the Xcode project."
+            exit 1
+          fi
+
+          if [[ "${BUILD_STATUS}" != "0" ]]; then
+            echo "STAGE 2 FAILED: Xcode did not build the unchanged source."
+            exit 1
+          fi
+
+          if [[ "${IDENTITY_STATUS}" != "0" ]]; then
+            echo "STAGE 2 FAILED: separate-install identity verification failed."
+            exit 1
+          fi
+
+          IPA_COUNT="$(
+            find "${ARTIFACT_ROOT}" -maxdepth 1 -type f \
+              -name 'M7FTM-DMR-Baseline-unsigned-*.ipa' \
+              | wc -l | tr -d ' '
+          )"
+
+          if [[ "${IPA_COUNT}" != "1" ]]; then
+            echo "STAGE 2 FAILED: expected exactly one identity IPA, found ${IPA_COUNT}."
+            exit 1
+          fi
+
+          echo "STAGE 2 PASSED:"
+          echo "  application source remains unchanged"
+          echo "  bundle identifier is ${TEST_BUNDLE_ID}"
+          echo "  display name is ${TEST_DISPLAY_NAME}"
+          echo "  one unsigned IPA was produced"
