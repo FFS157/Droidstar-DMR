@@ -10,8 +10,6 @@ env:
   QT_VERSION: "6.7.2"
   UPSTREAM_BASELINE_SHA: "ab8418f0b2a27714788d0a1f1f1ae7188994762c"
   XCODE_DEVELOPER_DIR: "/Applications/Xcode_15.4.app/Contents/Developer"
-  BUILD_ROOT: "${{ runner.temp }}/DroidStar-iOS-build"
-  ARTIFACT_ROOT: "${{ runner.temp }}/DroidStar-iOS-artifacts"
 
 jobs:
   build-unsigned-ios:
@@ -64,7 +62,7 @@ jobs:
           python3 -m aqt install-qt \
             mac ios "${QT_VERSION}" ios \
             --autodesktop \
-            --modules qtmultimedia qtshadertools \
+            --modules qtmultimedia \
             --outputdir "${RUNNER_TEMP}/Qt"
 
           QT_IOS_ROOT="${RUNNER_TEMP}/Qt/${QT_VERSION}/ios"
@@ -83,8 +81,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          BUILD_ROOT="${RUNNER_TEMP}/DroidStar-iOS-build"
+          ARTIFACT_ROOT="${RUNNER_TEMP}/DroidStar-iOS-artifacts"
+
           rm -rf "${BUILD_ROOT}" "${ARTIFACT_ROOT}"
           mkdir -p "${BUILD_ROOT}" "${ARTIFACT_ROOT}"
+
+          echo "BUILD_ROOT=${BUILD_ROOT}" >> "${GITHUB_ENV}"
+          echo "ARTIFACT_ROOT=${ARTIFACT_ROOT}" >> "${GITHUB_ENV}"
 
       - name: Generate the Xcode project with qmake
         id: qmake
@@ -176,7 +180,6 @@ jobs:
         shell: bash
         run: |
           set +e
-          mkdir -p "${ARTIFACT_ROOT}"
 
           {
             echo "DroidStar iOS unchanged-source baseline build"
@@ -202,7 +205,7 @@ jobs:
             echo
             echo "qmake stage status: ${{ steps.qmake.outputs.status }}"
             echo "xcodebuild stage status: ${{ steps.xcodebuild.outputs.status }}"
-          } > "${ARTIFACT_ROOT}/BUILD-MANIFEST.txt"
+          } > "${ARTIFACT_ROOT:-${RUNNER_TEMP}}/BUILD-MANIFEST.txt"
 
       - name: Upload build evidence and unsigned IPA
         if: always()
