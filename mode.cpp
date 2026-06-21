@@ -169,7 +169,20 @@ void Mode::mmdvm_connect_status(bool s)
 
 void Mode::in_audio_vol_changed(qreal v)
 {
-    m_audio->set_input_volume(v / m_attenuation);
+    qreal inputVolume = v / m_attenuation;
+
+#ifdef Q_OS_IOS
+    // Qt/iOS already supplies microphone samples at a conservative level.
+    // The legacy per-mode attenuation made DMR's full-scale UI setting reach
+    // only 20% of QAudioSource volume (m_attenuation == 5), which resulted in
+    // extremely low transmitted audio. Keep the legacy behaviour for other
+    // platforms and apply the direct 0.0-1.0 control only to iOS DMR.
+    if (m_mode == "DMR") {
+        inputVolume = qBound<qreal>(0.0, v, 1.0);
+    }
+#endif
+
+    m_audio->set_input_volume(inputVolume);
 }
 
 void Mode::out_audio_vol_changed(qreal v)
