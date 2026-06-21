@@ -534,11 +534,18 @@ Page {
                         spacing: 8
                         Label { text: qsTr("Mic"); font.pixelSize: 11; opacity: 0.6 }
                         Slider {
+                            id: micGainSlider
                             Layout.fillWidth: true
                             from: 0.0
                             to: 1.0
+                            stepSize: 0.01
                             value: appState ? appState.micGain : 0.5
-                            onMoved: droidstarRef.set_input_volume(value)
+                            onMoved: {
+                                if (appState)
+                                    appState.micGain = value
+                                if (droidstarRef)
+                                    droidstarRef.set_input_volume(value)
+                            }
                         }
                         Label {
                             text: Math.round((appState ? appState.micGain : 0.5) * 100) + "%"
