@@ -1,0 +1,375 @@
+name: iOS Stage 3 - M7FTM Mic Gain FIX1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  QT_VERSION: "6.7.2"
+  UPSTREAM_BASELINE_SHA: "ab8418f0b2a27714788d0a1f1f1ae7188994762c"
+  XCODE_DEVELOPER_DIR: "/Applications/Xcode_15.4.app/Contents/Developer"
+  TEST_BUNDLE_ID: "uk.co.m7ftm.droidstarbaseline"
+  TEST_DISPLAY_NAME: "M7FTM DMR Baseline"
+  STAGE_NAME: "Stage 3 Mic Gain FIX1"
+
+jobs:
+  build-unsigned-ios:
+    name: Build M7FTM Stage 3 mic gain FIX1
+    runs-on: macos-14
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify only the approved Stage 3 source files changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git cat-file -e "${UPSTREAM_BASELINE_SHA}^{commit}"
+
+          CHANGED_FILES="$(
+            git diff --name-only "${UPSTREAM_BASELINE_SHA}" -- . \
+              ':(exclude).github/**' | sort
+          )"
+
+          EXPECTED_FILES="$(printf '%s\n' \
+            'mode.cpp' \
+            'ui2026/pages/MainPage.qml')"
+
+          printf '%s\n' "${CHANGED_FILES}" > "${RUNNER_TEMP}/stage3-changed-files.txt"
+
+          if [[ "${CHANGED_FILES}" != "${EXPECTED_FILES}" ]]; then
+            echo "STAGE 3 SOURCE GATE FAILED: application changes do not match the approved scope."
+            echo "Expected:"
+            printf '  %s\n' 'mode.cpp' 'ui2026/pages/MainPage.qml'
+            echo "Actual:"
+            if [[ -n "${CHANGED_FILES}" ]]; then
+              printf '%s\n' "${CHANGED_FILES}" | sed 's/^/  /'
+            else
+              echo "  <none>"
+            fi
+            exit 1
+          fi
+
+          echo "Stage 3 source gate passed."
+          echo "Only these application files differ from baseline ${UPSTREAM_BASELINE_SHA}:"
+          printf '%s\n' "${CHANGED_FILES}" | sed 's/^/  /'
+
+      - name: Select Xcode 15.4
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -d "${XCODE_DEVELOPER_DIR}" ]]; then
+            echo "Expected Xcode was not found at ${XCODE_DEVELOPER_DIR}."
+            echo "Installed Xcode applications:"
+            find /Applications -maxdepth 1 -type d -name 'Xcode*.app' -print | sort
+            exit 1
+          fi
+
+          sudo xcode-select --switch "${XCODE_DEVELOPER_DIR}"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Create build and artifact folders
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUILD_ROOT="${RUNNER_TEMP}/DroidStar-iOS-stage3-build"
+          ARTIFACT_ROOT="${RUNNER_TEMP}/DroidStar-iOS-stage3-artifacts"
+
+          rm -rf "${BUILD_ROOT}" "${ARTIFACT_ROOT}"
+          mkdir -p "${BUILD_ROOT}" "${ARTIFACT_ROOT}"
+
+          echo "BUILD_ROOT=${BUILD_ROOT}" >> "${GITHUB_ENV}"
+          echo "ARTIFACT_ROOT=${ARTIFACT_ROOT}" >> "${GITHUB_ENV}"
+
+          if [[ -f "${RUNNER_TEMP}/stage3-changed-files.txt" ]]; then
+            cp "${RUNNER_TEMP}/stage3-changed-files.txt" \
+              "${ARTIFACT_ROOT}/STAGE3-CHANGED-FILES.txt"
+          fi
+
+      - name: Install Qt 6.7.2 for iOS
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          AQT_VENV="${RUNNER_TEMP}/aqt-venv"
+          rm -rf "${AQT_VENV}"
+          python3 -m venv "${AQT_VENV}"
+
+          "${AQT_VENV}/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --upgrade pip
+
+          "${AQT_VENV}/bin/python" -m pip install \
+            --disable-pip-version-check \
+            "aqtinstall==3.3.0"
+
+          "${AQT_VENV}/bin/python" -m aqt install-qt \
+            mac ios "${QT_VERSION}" ios \
+            --autodesktop \
+            --modules qtmultimedia \
+            --outputdir "${RUNNER_TEMP}/Qt"
+
+          QT_IOS_ROOT="${RUNNER_TEMP}/Qt/${QT_VERSION}/ios"
+
+          if [[ ! -x "${QT_IOS_ROOT}/bin/qmake" ]]; then
+            echo "iOS qmake was not installed at ${QT_IOS_ROOT}/bin/qmake"
+            find "${RUNNER_TEMP}/Qt" -maxdepth 5 -type f -name qmake -print || true
+            exit 1
+          fi
+
+          echo "QT_IOS_ROOT=${QT_IOS_ROOT}" >> "${GITHUB_ENV}"
+          "${QT_IOS_ROOT}/bin/qmake" -v
+
+      - name: Generate the Xcode project with qmake
+        id: qmake
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+
+          cd "${BUILD_ROOT}"
+
+          "${QT_IOS_ROOT}/bin/qmake" \
+            "${GITHUB_WORKSPACE}/DroidStar.pro" \
+            CONFIG+=release \
+            2>&1 | tee "${ARTIFACT_ROOT}/qmake.log"
+
+          QMAKE_STATUS=${PIPESTATUS[0]}
+          echo "status=${QMAKE_STATUS}" >> "${GITHUB_OUTPUT}"
+
+          if [[ ${QMAKE_STATUS} -eq 0 ]]; then
+            xcodebuild -list -project "${BUILD_ROOT}/DroidStar.xcodeproj" \
+              2>&1 | tee "${ARTIFACT_ROOT}/xcode-project-list.log"
+
+            ditto -c -k --sequesterRsrc --keepParent \
+              "${BUILD_ROOT}/DroidStar.xcodeproj" \
+              "${ARTIFACT_ROOT}/DroidStar.xcodeproj.zip"
+          fi
+
+          exit 0
+
+      - name: Build with separate bundle identifier
+        id: xcodebuild
+        if: steps.qmake.outputs.status == '0'
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+
+          mkdir -p "${BUILD_ROOT}/output"
+
+          xcodebuild \
+            -project "${BUILD_ROOT}/DroidStar.xcodeproj" \
+            -target DroidStar \
+            -configuration Release \
+            -sdk iphoneos \
+            -arch arm64 \
+            CONFIGURATION_BUILD_DIR="${BUILD_ROOT}/output" \
+            PRODUCT_BUNDLE_IDENTIFIER="${TEST_BUNDLE_ID}" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            build \
+            2>&1 | tee "${ARTIFACT_ROOT}/xcodebuild.log"
+
+          BUILD_STATUS=${PIPESTATUS[0]}
+          echo "status=${BUILD_STATUS}" >> "${GITHUB_OUTPUT}"
+          exit 0
+
+      - name: Apply and verify separate-install identity
+        id: identity
+        if: steps.xcodebuild.outputs.status == '0'
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+
+          APP_PATH="$(find "${BUILD_ROOT}/output" -maxdepth 2 -type d -name '*.app' -print -quit)"
+
+          if [[ -z "${APP_PATH}" ]]; then
+            echo "No .app bundle was found after the successful Xcode build."
+            echo "status=1" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          INFO_PLIST="${APP_PATH}/Info.plist"
+
+          if [[ ! -f "${INFO_PLIST}" ]]; then
+            echo "Info.plist was not found at ${INFO_PLIST}."
+            echo "status=1" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleDisplayName ${TEST_DISPLAY_NAME}" \
+            "${INFO_PLIST}"
+
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleName DroidStar" \
+            "${INFO_PLIST}"
+
+          ACTUAL_BUNDLE_ID="$(
+            /usr/libexec/PlistBuddy \
+              -c 'Print :CFBundleIdentifier' \
+              "${INFO_PLIST}"
+          )"
+
+          ACTUAL_DISPLAY_NAME="$(
+            /usr/libexec/PlistBuddy \
+              -c 'Print :CFBundleDisplayName' \
+              "${INFO_PLIST}"
+          )"
+
+          ACTUAL_EXECUTABLE="$(
+            /usr/libexec/PlistBuddy \
+              -c 'Print :CFBundleExecutable' \
+              "${INFO_PLIST}"
+          )"
+
+          {
+            echo "Expected bundle identifier: ${TEST_BUNDLE_ID}"
+            echo "Actual bundle identifier:   ${ACTUAL_BUNDLE_ID}"
+            echo "Expected display name:      ${TEST_DISPLAY_NAME}"
+            echo "Actual display name:        ${ACTUAL_DISPLAY_NAME}"
+            echo "Executable:                 ${ACTUAL_EXECUTABLE}"
+            echo "Application bundle:         $(basename "${APP_PATH}")"
+          } | tee "${ARTIFACT_ROOT}/IDENTITY-REPORT.txt"
+
+          if [[ "${ACTUAL_BUNDLE_ID}" != "${TEST_BUNDLE_ID}" ]]; then
+            echo "Bundle identifier verification failed."
+            echo "status=1" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [[ "${ACTUAL_DISPLAY_NAME}" != "${TEST_DISPLAY_NAME}" ]]; then
+            echo "Display-name verification failed."
+            echo "status=1" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "APP_PATH=${APP_PATH}" >> "${GITHUB_ENV}"
+          echo "status=0" >> "${GITHUB_OUTPUT}"
+          exit 0
+
+      - name: Package the separate-install unsigned IPA
+        if: steps.identity.outputs.status == '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PACKAGE_ROOT="${ARTIFACT_ROOT}/unsigned-ipa"
+          rm -rf "${PACKAGE_ROOT}"
+          mkdir -p "${PACKAGE_ROOT}/Payload"
+
+          ditto \
+            "${APP_PATH}" \
+            "${PACKAGE_ROOT}/Payload/$(basename "${APP_PATH}")"
+
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          IPA_NAME="M7FTM-DMR-Stage3-MicGain-unsigned-${SHORT_SHA}.ipa"
+
+          cd "${PACKAGE_ROOT}"
+          /usr/bin/zip -qry "${ARTIFACT_ROOT}/${IPA_NAME}" Payload
+
+          echo "Unsigned IPA created: ${ARTIFACT_ROOT}/${IPA_NAME}"
+          /usr/bin/du -h "${ARTIFACT_ROOT}/${IPA_NAME}"
+
+      - name: Write the build manifest
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          mkdir -p "${ARTIFACT_ROOT}"
+
+          {
+            echo "DroidStar iOS Stage 3 Mic Gain FIX1"
+            echo "UTC date: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "Repository commit: ${GITHUB_SHA}"
+            echo "Upstream baseline: ${UPSTREAM_BASELINE_SHA}"
+            echo "Approved changed files: mode.cpp, ui2026/pages/MainPage.qml"
+            echo "Bundle identifier: ${TEST_BUNDLE_ID}"
+            echo "Display name: ${TEST_DISPLAY_NAME}"
+            echo "Runner: ${RUNNER_NAME}"
+            echo "Runner OS: ${RUNNER_OS}"
+            echo "Runner architecture: ${RUNNER_ARCH}"
+            echo
+            echo "Xcode:"
+            xcodebuild -version 2>&1
+            echo
+            echo "iPhoneOS SDK:"
+            xcrun --sdk iphoneos --show-sdk-version 2>&1
+            echo
+            echo "Qt iOS qmake:"
+            if [[ -n "${QT_IOS_ROOT:-}" && -x "${QT_IOS_ROOT}/bin/qmake" ]]; then
+              "${QT_IOS_ROOT}/bin/qmake" -v 2>&1
+            else
+              echo "Qt iOS qmake was not available."
+            fi
+            echo
+            echo "qmake stage status: ${{ steps.qmake.outputs.status }}"
+            echo "xcodebuild stage status: ${{ steps.xcodebuild.outputs.status }}"
+            echo "identity stage status: ${{ steps.identity.outputs.status }}"
+          } > "${ARTIFACT_ROOT}/BUILD-MANIFEST.txt"
+
+      - name: Upload separate-install IPA and build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: M7FTM-DMR-stage3-micgain-${{ github.run_number }}
+          path: ${{ runner.temp }}/DroidStar-iOS-stage3-artifacts
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce the Stage 3 mic gain gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          QMAKE_STATUS="${{ steps.qmake.outputs.status }}"
+          BUILD_STATUS="${{ steps.xcodebuild.outputs.status }}"
+          IDENTITY_STATUS="${{ steps.identity.outputs.status }}"
+
+          if [[ "${QMAKE_STATUS}" != "0" ]]; then
+            echo "STAGE 3 FAILED: qmake did not generate the Xcode project."
+            exit 1
+          fi
+
+          if [[ "${BUILD_STATUS}" != "0" ]]; then
+            echo "STAGE 3 FAILED: Xcode did not build the approved Stage 3 source."
+            exit 1
+          fi
+
+          if [[ "${IDENTITY_STATUS}" != "0" ]]; then
+            echo "STAGE 3 FAILED: separate-install identity verification failed."
+            exit 1
+          fi
+
+          IPA_COUNT="$(
+            find "${ARTIFACT_ROOT}" -maxdepth 1 -type f \
+              -name 'M7FTM-DMR-Stage3-MicGain-unsigned-*.ipa' \
+              | wc -l | tr -d ' '
+          )"
+
+          if [[ "${IPA_COUNT}" != "1" ]]; then
+            echo "STAGE 3 FAILED: expected exactly one identity IPA, found ${IPA_COUNT}."
+            exit 1
+          fi
+
+          echo "STAGE 3 PASSED:"
+          echo "  only mode.cpp and ui2026/pages/MainPage.qml differ from baseline"
+          echo "  bundle identifier is ${TEST_BUNDLE_ID}"
+          echo "  display name is ${TEST_DISPLAY_NAME}"
+          echo "  one Stage 3 unsigned IPA was produced"
